@@ -1,37 +1,46 @@
 #!/usr/bin/env python3
 """
-CBZ/ZIP -> PDF Telegram Bot
-===========================
+CBZ/ZIP -> PDF Telegram Bot (Pyrogram / MTProto edition)
+=========================================================
 
-A production-ready Telegram bot that converts .cbz (or plain .zip) comic
-archives into a single PDF file.
+Same feature set as the python-telegram-bot version, but built on
+**Pyrogram**, which talks to Telegram directly over MTProto instead of
+going through the regular Bot API HTTP server. This removes the Bot API's
+20 MB download limit — with Pyrogram a bot can download/upload files up
+to **2 GB** (4 GB for Telegram Premium accounts) with zero extra setup.
 
 Key features
 ------------
-- Accepts .cbz / .zip files (rejects everything else with a clear message).
-- Extracts images, sorts them naturally (page1, page2, ..., page10 - not
-  page1, page10, page2), and stitches them into one PDF.
+- Accepts .cbz / .zip files up to 200 MB (configurable, well under
+  Pyrogram's 2 GB ceiling).
+- Extracts images, sorts them naturally (page2 < page10), stitches them
+  into one PDF using Pillow.
 - STRICT global concurrency limit of 1: only one conversion job runs at a
-  time across the whole bot. Everything else waits in an asyncio.Queue.
-- Users get a live queue position message, and it is updated as the queue
-  moves.
-- Real-time progress messages: Queued -> Downloading -> Extracting ->
-  Converting -> Uploading -> Done.
+  time across the whole bot, via asyncio.Queue + one background worker.
+- Live queue-position messages, updated as the queue moves.
+- Real-time progress: Downloading -> Extracting -> Converting -> Uploading -> Done.
 - All temp files/directories are removed after each job (success or
   failure) via try/finally.
-- Graceful error handling: corrupted zip, empty archive, unsupported/
-  unreadable images, oversized files, Telegram API errors.
+- Graceful error handling for corrupted archives, unreadable images,
+  oversized files, and Telegram/network errors.
 
 Requirements
 ------------
-    pip install "python-telegram-bot>=20,<22" Pillow
+    pip install pyrogram tgcrypto Pillow
 
-Set your bot token as an environment variable before running:
-    export TELEGRAM_BOT_TOKEN="123456:ABC-your-token-here"
-    python cbz_to_pdf_bot.py
+You need THREE credentials (all free):
+    1. API_ID    - from https://my.telegram.org  (API Development Tools)
+    2. API_HASH  - from https://my.telegram.org  (API Development Tools)
+    3. BOT_TOKEN - from @BotFather on Telegram
 
-Tech stack: Python 3.10+, python-telegram-bot v20+ (async), Pillow, zipfile,
-asyncio.Queue + a single background worker task.
+Set them as environment variables before running:
+    export API_ID="12345678"
+    export API_HASH="abcdef1234567890abcdef1234567890"
+    export BOT_TOKEN="123456:ABC-your-token-here"
+    python main.py
+
+Tech stack: Python 3.10+, Pyrogram (MTProto), tgcrypto (fast crypto),
+Pillow, zipfile, asyncio.Queue + a single background worker task.
 """
 
 from __future__ import annotations
@@ -44,29 +53,26 @@ import shutil
 import tempfile
 import uuid
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from PIL import Image, UnidentifiedImageError
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import RPCError
 
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+API_ID = os.environ.get("API_ID", "")
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # Safety limits - tune as needed for your server.
+# Pyrogram (MTProto) supports up to 2 GB (4 GB for Premium), but keep this
+# reasonable for your server's RAM/disk/CPU.
 MAX_FILE_SIZE_MB = 200
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {".cbz", ".zip"}
@@ -80,7 +86,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("cbz2pdf_bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)  # quiet PTB's http logs
+logging.getLogger("pyrogram").setLevel(logging.WARNING)  # quiet Pyrogram's internal logs
 
 
 # --------------------------------------------------------------------------
@@ -91,12 +97,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # quiet PTB's http logs
 class ConversionJob:
     job_id: str
     chat_id: int
-    file_id: str
+    message: Message           # the original message containing the document
     file_name: str
     file_size: int
-    status_message_id: Optional[int] = None
-    queue_position: int = 0
-    work_dir: Path = field(default=None)  # type: ignore[assignment]
+    status_message: Optional[Message] = None
 
 
 class JobQueue:
@@ -124,15 +128,16 @@ class JobQueue:
     def task_done(self) -> None:
         self._queue.task_done()
 
-    async def position_of(self, job: ConversionJob) -> int:
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+    async def snapshot(self) -> list[ConversionJob]:
         async with self._lock:
-            try:
-                return self._pending.index(job) + 1
-            except ValueError:
-                return 0
+            return list(self._pending)
 
 
 job_queue = JobQueue()
+worker_busy = False  # simple global flag, only touched by the single worker
 
 
 # --------------------------------------------------------------------------
@@ -148,14 +153,14 @@ def natural_sort_key(name: str):
     ]
 
 
-async def safe_edit(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, text: str) -> None:
-    """Edit a status message, ignoring 'message is not modified' errors."""
+async def safe_edit(message: Optional[Message], text: str) -> None:
+    """Edit a status message, ignoring 'message not modified' / harmless errors."""
+    if message is None:
+        return
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=message_id, text=text, parse_mode=ParseMode.HTML
-        )
-    except TelegramError as e:
-        if "not modified" not in str(e).lower():
+        await message.edit_text(text)
+    except RPCError as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e):
             logger.warning("Failed to edit status message: %s", e)
 
 
@@ -204,9 +209,7 @@ def build_pdf_from_images(image_paths: list[Path], output_pdf: Path) -> tuple[in
             try:
                 img = Image.open(img_path)
                 img.load()  # force read now so we catch errors early
-                if img.mode in ("RGBA", "P", "LA"):
-                    img = img.convert("RGB")
-                elif img.mode != "RGB":
+                if img.mode != "RGB":
                     img = img.convert("RGB")
                 frames.append(img)
             except (UnidentifiedImageError, OSError):
@@ -229,13 +232,20 @@ def build_pdf_from_images(image_paths: list[Path], output_pdf: Path) -> tuple[in
 
 
 # --------------------------------------------------------------------------
-# Telegram handlers
+# Pyrogram client
 # --------------------------------------------------------------------------
 
+app = Client(
+    "cbz2pdf_bot_session",
+    api_id=int(API_ID) if API_ID else None,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
+
 WELCOME_TEXT = (
-    "👋 <b>CBZ → PDF Converter Bot</b>\n\n"
-    "Send me a <code>.cbz</code> or <code>.zip</code> comic archive and I'll "
-    "convert it into a single PDF, page by page.\n\n"
+    "👋 **CBZ → PDF Converter Bot**\n\n"
+    "Send me a `.cbz` or `.zip` comic archive and I'll convert it into a "
+    "single PDF, page by page.\n\n"
     f"📦 Max file size: {MAX_FILE_SIZE_MB} MB\n"
     "⚙️ I process one file at a time — if I'm busy, you'll be queued "
     "and I'll tell you your position.\n\n"
@@ -243,39 +253,36 @@ WELCOME_TEXT = (
 )
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_html(WELCOME_TEXT)
+@app.on_message(filters.command(["start", "help"]))
+async def cmd_start(client: Client, message: Message) -> None:
+    await message.reply_text(WELCOME_TEXT)
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q_len = job_queue._queue.qsize()
-    busy = context.bot_data.get("worker_busy", False)
-    if not busy and q_len == 0:
-        await update.message.reply_text("✅ I'm idle — send a file and I'll start right away.")
+@app.on_message(filters.command("status"))
+async def cmd_status(client: Client, message: Message) -> None:
+    q_len = job_queue.qsize()
+    if not worker_busy and q_len == 0:
+        await message.reply_text("✅ I'm idle — send a file and I'll start right away.")
     else:
-        await update.message.reply_text(
+        await message.reply_text(
             f"⏳ Currently processing 1 file, with {q_len} file(s) waiting in queue."
         )
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    doc = update.message.document
-    if doc is None:
-        return
-
-    chat_id = update.effective_chat.id
+@app.on_message(filters.document)
+async def handle_document(client: Client, message: Message) -> None:
+    doc = message.document
     file_name = doc.file_name or "archive"
     ext = Path(file_name).suffix.lower()
 
     if ext not in ALLOWED_EXTENSIONS:
-        await update.message.reply_text(
-            "❌ Unsupported file type. Please send a <code>.cbz</code> or <code>.zip</code> file.",
-            parse_mode=ParseMode.HTML,
+        await message.reply_text(
+            "❌ Unsupported file type. Please send a `.cbz` or `.zip` file."
         )
         return
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ File is too large ({doc.file_size / (1024*1024):.1f} MB). "
             f"Max allowed is {MAX_FILE_SIZE_MB} MB."
         )
@@ -283,69 +290,53 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     job = ConversionJob(
         job_id=str(uuid.uuid4())[:8],
-        chat_id=chat_id,
-        file_id=doc.file_id,
+        chat_id=message.chat.id,
+        message=message,
         file_name=file_name,
         file_size=doc.file_size or 0,
     )
 
     position = await job_queue.put(job)
 
-    if position == 1 and not context.bot_data.get("worker_busy", False):
-        status_msg = await update.message.reply_text("⏳ Starting conversion shortly...")
+    if position == 1 and not worker_busy:
+        status_msg = await message.reply_text("⏳ Starting conversion shortly...")
     else:
-        status_msg = await update.message.reply_text(
-            f"📥 Added to the queue.\nCurrent position: <b>#{position}</b>\n"
-            "I'll notify you with progress once it's your turn.",
-            parse_mode=ParseMode.HTML,
+        status_msg = await message.reply_text(
+            f"📥 Added to the queue.\nCurrent position: **#{position}**\n"
+            "I'll notify you with progress once it's your turn."
         )
 
-    job.status_message_id = status_msg.message_id
+    job.status_message = status_msg
 
 
-async def handle_wrong_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catches non-document messages (photos sent as images, plain text, etc.)."""
-    await update.message.reply_text(
-        "📎 Please send your comic archive as a <b>file/document</b> "
-        "(<code>.cbz</code> or <code>.zip</code>), not as a photo or text.",
-        parse_mode=ParseMode.HTML,
+@app.on_message(filters.text & ~filters.command(["start", "help", "status"]) | filters.photo | filters.video)
+async def handle_wrong_type(client: Client, message: Message) -> None:
+    await message.reply_text(
+        "📎 Please send your comic archive as a **file/document** "
+        "(`.cbz` or `.zip`), not as a photo, video, or plain text."
     )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception while processing update", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ Something went wrong unexpectedly. Please try again.",
-            )
-        except TelegramError:
-            pass
 
 
 # --------------------------------------------------------------------------
 # Background worker (strict 1-task-at-a-time)
 # --------------------------------------------------------------------------
 
-async def process_job(job: ConversionJob, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def process_job(job: ConversionJob) -> None:
     work_dir = BASE_TMP_DIR / job.job_id
     extract_dir = work_dir / "extracted"
     archive_path = work_dir / f"input{Path(job.file_name).suffix.lower()}"
     output_pdf = work_dir / f"{Path(job.file_name).stem}.pdf"
 
     async def update_status(text: str) -> None:
-        if job.status_message_id:
-            await safe_edit(context, job.chat_id, job.status_message_id, text)
+        await safe_edit(job.status_message, text)
 
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
         extract_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Download
+        # 1. Download (MTProto -> up to 2GB, no Bot API 20MB cap)
         await update_status("📥 Downloading file...")
-        tg_file = await context.bot.get_file(job.file_id)
-        await tg_file.download_to_drive(custom_path=str(archive_path))
+        await job.message.download(file_name=str(archive_path))
 
         # 2. Extract & sort
         await update_status("📂 Extracting and sorting images...")
@@ -358,13 +349,11 @@ async def process_job(job: ConversionJob, context: ContextTypes.DEFAULT_TYPE) ->
 
         # 4. Upload
         await update_status("📤 Uploading PDF...")
-        with open(output_pdf, "rb") as f:
-            await context.bot.send_document(
-                chat_id=job.chat_id,
-                document=f,
-                filename=f"{Path(job.file_name).stem}.pdf",
-                caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
-            )
+        await job.message.reply_document(
+            document=str(output_pdf),
+            file_name=f"{Path(job.file_name).stem}.pdf",
+            caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
+        )
 
         await update_status(f"✅ Conversion complete — {page_count} page(s){skip_note}. PDF sent above.")
 
@@ -373,11 +362,11 @@ async def process_job(job: ConversionJob, context: ContextTypes.DEFAULT_TYPE) ->
         logger.info("Job %s failed with user error: %s", job.job_id, e)
         await update_status(f"❌ Conversion failed: {e}")
 
-    except TelegramError as e:
+    except RPCError as e:
         logger.warning("Job %s failed with Telegram error: %s", job.job_id, e)
         await update_status(f"❌ Telegram error while handling your file: {e}")
 
-    except Exception as e:  # noqa: BLE001 - last-resort safety net per job
+    except Exception:  # noqa: BLE001 - last-resort safety net per job
         logger.exception("Job %s failed with unexpected error", job.job_id)
         await update_status("❌ An unexpected error occurred while converting your file. Please try again.")
 
@@ -386,74 +375,64 @@ async def process_job(job: ConversionJob, context: ContextTypes.DEFAULT_TYPE) ->
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-async def notify_queue_positions(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def notify_queue_positions() -> None:
     """After a job starts/finishes, refresh position messages for those still waiting."""
-    async with job_queue._lock:
-        pending_snapshot = list(job_queue._pending)
-
+    pending_snapshot = await job_queue.snapshot()
     for idx, waiting_job in enumerate(pending_snapshot, start=1):
-        if waiting_job.status_message_id:
-            await safe_edit(
-                context,
-                waiting_job.chat_id,
-                waiting_job.status_message_id,
-                f"📥 Waiting in queue.\nCurrent position: <b>#{idx}</b>",
-            )
+        await safe_edit(
+            waiting_job.status_message,
+            f"📥 Waiting in queue.\nCurrent position: **#{idx}**",
+        )
 
 
-async def queue_worker(application: Application) -> None:
+async def queue_worker() -> None:
     """The single background task that guarantees global concurrency = 1."""
-    context = ContextTypes.DEFAULT_TYPE(application=application)
+    global worker_busy
     logger.info("Queue worker started.")
     while True:
         job = await job_queue.get()
-        application.bot_data["worker_busy"] = True
+        worker_busy = True
         try:
             logger.info("Processing job %s (%s) for chat %s", job.job_id, job.file_name, job.chat_id)
-            await process_job(job, context)
+            await process_job(job)
         except Exception:
             logger.exception("Uncaught error while processing job %s", job.job_id)
         finally:
             job_queue.task_done()
-            application.bot_data["worker_busy"] = False
-            await notify_queue_positions(context)
-
-
-async def post_init(application: Application) -> None:
-    BASE_TMP_DIR.mkdir(parents=True, exist_ok=True)
-    application.bot_data["worker_busy"] = False
-    # Launch the single global worker task.
-    application.create_task(queue_worker(application))
-    logger.info("Bot initialized. Temp dir: %s", BASE_TMP_DIR)
+            worker_busy = False
+            await notify_queue_positions()
 
 
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
-def main() -> None:
-    if not BOT_TOKEN:
+async def main() -> None:
+    missing = [name for name, val in (("API_ID", API_ID), ("API_HASH", API_HASH), ("BOT_TOKEN", BOT_TOKEN)) if not val]
+    if missing:
         raise SystemExit(
-            "ERROR: Set the TELEGRAM_BOT_TOKEN environment variable before running this bot.\n"
-            "Example: export TELEGRAM_BOT_TOKEN='123456:ABC-your-token'"
+            f"ERROR: Missing required environment variable(s): {', '.join(missing)}.\n"
+            "Get API_ID / API_HASH from https://my.telegram.org and BOT_TOKEN from @BotFather.\n"
+            "Example:\n"
+            "  export API_ID='12345678'\n"
+            "  export API_HASH='abcdef1234567890abcdef1234567890'\n"
+            "  export BOT_TOKEN='123456:ABC-your-token'\n"
         )
 
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    BASE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
+    await app.start()
+    logger.info("Bot started. Temp dir: %s", BASE_TMP_DIR)
 
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(
-        MessageHandler(~filters.COMMAND & ~filters.Document.ALL, handle_wrong_type)
-    )
+    worker_task = asyncio.create_task(queue_worker())
 
-    application.add_error_handler(error_handler)
-
-    logger.info("Starting bot (long polling)...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot is up and polling for messages...")
+    try:
+        await asyncio.Event().wait()  # run forever
+    finally:
+        worker_task.cancel()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
