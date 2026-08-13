@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-CBZ/ZIP -> PDF Telegram Bot (Pyrogram / MTProto edition)
-=========================================================
+CBZ/ZIP -> PDF Telegram Bot (Telethon / MTProto edition)
+==========================================================
 
-Same feature set as the python-telegram-bot version, but built on
-**Pyrogram**, which talks to Telegram directly over MTProto instead of
-going through the regular Bot API HTTP server. This removes the Bot API's
-20 MB download limit — with Pyrogram a bot can download/upload files up
-to **2 GB** (4 GB for Telegram Premium accounts) with zero extra setup.
+Same feature set as before, but built on **Telethon**, which talks to
+Telegram directly over MTProto instead of going through the regular Bot
+API HTTP server. This removes the Bot API's 20 MB download limit — with
+Telethon a bot can download/upload files up to **2 GB** (4 GB for
+Telegram Premium accounts) with zero extra setup.
 
 Key features
 ------------
 - Accepts .cbz / .zip files up to 200 MB (configurable, well under
-  Pyrogram's 2 GB ceiling).
+  Telethon's 2 GB ceiling).
 - Extracts images, sorts them naturally (page2 < page10), stitches them
   into one PDF using Pillow.
 - STRICT global concurrency limit of 1: only one conversion job runs at a
@@ -26,7 +26,7 @@ Key features
 
 Requirements
 ------------
-    pip install pyrogram tgcrypto Pillow
+    pip install telethon Pillow
 
 You need THREE credentials (all free):
     1. API_ID    - from https://my.telegram.org  (API Development Tools)
@@ -39,8 +39,8 @@ Set them as environment variables before running:
     export BOT_TOKEN="123456:ABC-your-token-here"
     python main.py
 
-Tech stack: Python 3.10+, Pyrogram (MTProto), tgcrypto (fast crypto),
-Pillow, zipfile, asyncio.Queue + a single background worker task.
+Tech stack: Python 3.10+, Telethon (MTProto), Pillow, zipfile,
+asyncio.Queue + a single background worker task.
 """
 
 from __future__ import annotations
@@ -58,9 +58,9 @@ from pathlib import Path
 from typing import Optional
 
 from PIL import Image, UnidentifiedImageError
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import RPCError
+from telethon import TelegramClient, events
+from telethon.tl.custom.message import Message
+from telethon.errors import RPCError, MessageNotModifiedError
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -71,7 +71,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # Safety limits - tune as needed for your server.
-# Pyrogram (MTProto) supports up to 2 GB (4 GB for Premium), but keep this
+# Telethon (MTProto) supports up to 2 GB (4 GB for Premium), but keep this
 # reasonable for your server's RAM/disk/CPU.
 MAX_FILE_SIZE_MB = 200
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -92,7 +92,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("cbz2pdf_bot")
-logging.getLogger("pyrogram").setLevel(logging.WARNING)  # quiet Pyrogram's internal logs
+logging.getLogger("telethon").setLevel(logging.WARNING)  # quiet Telethon's internal logs
 
 
 # --------------------------------------------------------------------------
@@ -164,10 +164,11 @@ async def safe_edit(message: Optional[Message], text: str) -> None:
     if message is None:
         return
     try:
-        await message.edit_text(text)
+        await message.edit(text)
+    except MessageNotModifiedError:
+        pass
     except RPCError as e:
-        if "MESSAGE_NOT_MODIFIED" not in str(e):
-            logger.warning("Failed to edit status message: %s", e)
+        logger.warning("Failed to edit status message: %s", e)
 
 
 def extract_images_from_archive(archive_path: Path, extract_dir: Path) -> list[Path]:
@@ -238,14 +239,13 @@ def build_pdf_from_images(image_paths: list[Path], output_pdf: Path) -> tuple[in
 
 
 # --------------------------------------------------------------------------
-# Pyrogram client
+# Telethon client
 # --------------------------------------------------------------------------
 
-app = Client(
+client = TelegramClient(
     "cbz2pdf_bot_session",
     api_id=int(API_ID) if API_ID else None,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
 )
 
 WELCOME_TEXT = (
@@ -259,47 +259,55 @@ WELCOME_TEXT = (
 )
 
 
-@app.on_message(filters.command(["start", "help"]))
-async def cmd_start(client: Client, message: Message) -> None:
-    await message.reply_text(WELCOME_TEXT)
+@client.on(events.NewMessage(pattern="/start"))
+@client.on(events.NewMessage(pattern="/help"))
+async def cmd_start(event: events.NewMessage.Event) -> None:
+    await event.reply(WELCOME_TEXT)
 
 
-@app.on_message(filters.command("status"))
-async def cmd_status(client: Client, message: Message) -> None:
+@client.on(events.NewMessage(pattern="/status"))
+async def cmd_status(event: events.NewMessage.Event) -> None:
     q_len = job_queue.qsize()
     if not worker_busy and q_len == 0:
-        await message.reply_text("✅ I'm idle — send a file and I'll start right away.")
+        await event.reply("✅ I'm idle — send a file and I'll start right away.")
     else:
-        await message.reply_text(
+        await event.reply(
             f"⏳ Currently processing 1 file, with {q_len} file(s) waiting in queue."
         )
 
 
-@app.on_message(filters.document)
-async def handle_document(client: Client, message: Message) -> None:
+@client.on(events.NewMessage(func=lambda e: e.document is not None))
+async def handle_document(event: events.NewMessage.Event) -> None:
+    message: Message = event.message
     doc = message.document
-    file_name = doc.file_name or "archive"
+
+    # Extract the original filename from document attributes.
+    file_name = "archive"
+    for attr in doc.attributes:
+        if hasattr(attr, "file_name") and attr.file_name:
+            file_name = attr.file_name
+            break
+
     ext = Path(file_name).suffix.lower()
 
     if ext not in ALLOWED_EXTENSIONS:
-        await message.reply_text(
-            "❌ Unsupported file type. Please send a `.cbz` or `.zip` file."
-        )
+        await event.reply("❌ Unsupported file type. Please send a `.cbz` or `.zip` file.")
         return
 
-    if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
-        await message.reply_text(
-            f"❌ File is too large ({doc.file_size / (1024*1024):.1f} MB). "
+    file_size = doc.size or 0
+    if file_size and file_size > MAX_FILE_SIZE_BYTES:
+        await event.reply(
+            f"❌ File is too large ({file_size / (1024*1024):.1f} MB). "
             f"Max allowed is {MAX_FILE_SIZE_MB} MB."
         )
         return
 
     job = ConversionJob(
         job_id=str(uuid.uuid4())[:8],
-        chat_id=message.chat.id,
+        chat_id=event.chat_id,
         message=message,
         file_name=file_name,
-        file_size=doc.file_size or 0,
+        file_size=file_size,
     )
 
     # IMPORTANT: create + attach the status message BEFORE the job is put
@@ -308,11 +316,9 @@ async def handle_document(client: Client, message: Message) -> None:
     # while it's still None, silently dropping the first progress updates.
     will_start_immediately = job_queue.qsize() == 0 and not worker_busy
     if will_start_immediately:
-        status_msg = await message.reply_text("⏳ Starting conversion shortly...")
+        status_msg = await event.reply("⏳ Starting conversion shortly...")
     else:
-        status_msg = await message.reply_text(
-            "📥 Added to the queue.\nFiguring out your position..."
-        )
+        status_msg = await event.reply("📥 Added to the queue.\nFiguring out your position...")
     job.status_message = status_msg
 
     position = await job_queue.put(job)
@@ -324,12 +330,18 @@ async def handle_document(client: Client, message: Message) -> None:
             "I'll notify you with progress once it's your turn.",
         )
 
-    logger.info("Queued job %s (%s, %.1f MB) at position %s", job.job_id, file_name, job.file_size / (1024*1024), position)
+    logger.info(
+        "Queued job %s (%s, %.1f MB) at position %s",
+        job.job_id, file_name, job.file_size / (1024 * 1024), position,
+    )
 
 
-@app.on_message(filters.text & ~filters.command(["start", "help", "status"]) | filters.photo | filters.video)
-async def handle_wrong_type(client: Client, message: Message) -> None:
-    await message.reply_text(
+@client.on(events.NewMessage(func=lambda e: (
+    e.document is None
+    and not (e.raw_text or "").startswith(("/start", "/help", "/status"))
+)))
+async def handle_wrong_type(event: events.NewMessage.Event) -> None:
+    await event.reply(
         "📎 Please send your comic archive as a **file/document** "
         "(`.cbz` or `.zip`), not as a photo, video, or plain text."
     )
@@ -357,18 +369,22 @@ async def process_job(job: ConversionJob) -> None:
         logger.info("Job %s: download starting", job.job_id)
 
         last_reported = -1
+        main_loop = asyncio.get_running_loop()
 
-        async def dl_progress(current: int, total: int) -> None:
+        def dl_progress(current: int, total: int) -> None:
             nonlocal last_reported
             pct = int(current * 100 / total) if total else 0
-            # only push a Telegram edit every 10% to avoid flood limits
             if pct != last_reported and pct % 10 == 0:
                 last_reported = pct
-                await update_status(f"📥 Downloading file... ({pct}%)")
+                # progress_callback runs in the same event loop for Telethon,
+                # but schedule safely regardless.
+                asyncio.run_coroutine_threadsafe(
+                    update_status(f"📥 Downloading file... ({pct}%)"), main_loop
+                )
 
         try:
             await asyncio.wait_for(
-                job.message.download(file_name=str(archive_path), progress=dl_progress),
+                client.download_media(job.message, file=str(archive_path), progress_callback=dl_progress),
                 timeout=DOWNLOAD_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -376,6 +392,10 @@ async def process_job(job: ConversionJob) -> None:
                 f"Download timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes. "
                 "This is usually a network issue on the server — please try again."
             )
+
+        if not archive_path.exists():
+            raise ValueError("Download finished but the file could not be found on disk.")
+
         logger.info("Job %s: download finished (%.1f MB)", job.job_id, archive_path.stat().st_size / (1024*1024))
 
         # 2. Extract & sort
@@ -393,10 +413,13 @@ async def process_job(job: ConversionJob) -> None:
         await update_status("📤 Uploading PDF...")
         try:
             await asyncio.wait_for(
-                job.message.reply_document(
-                    document=str(output_pdf),
-                    file_name=f"{Path(job.file_name).stem}.pdf",
+                client.send_file(
+                    job.chat_id,
+                    str(output_pdf),
                     caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
+                    force_document=True,
+                    file_name=f"{Path(job.file_name).stem}.pdf",
+                    reply_to=job.message.id,
                 ),
                 timeout=UPLOAD_TIMEOUT_SECONDS,
             )
@@ -473,17 +496,13 @@ async def main() -> None:
 
     BASE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    await app.start()
+    await client.start(bot_token=BOT_TOKEN)
     logger.info("Bot started. Temp dir: %s", BASE_TMP_DIR)
 
-    worker_task = asyncio.create_task(queue_worker())
+    asyncio.create_task(queue_worker())
 
     logger.info("Bot is up and polling for messages...")
-    try:
-        await asyncio.Event().wait()  # run forever
-    finally:
-        worker_task.cancel()
-        await app.stop()
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
