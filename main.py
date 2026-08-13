@@ -81,6 +81,12 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 # Base directory for all temporary work. Each job gets its own uuid subdir.
 BASE_TMP_DIR = Path(tempfile.gettempdir()) / "cbz2pdf_bot"
 
+# Hard timeouts so a stalled network call can never hang the bot forever.
+# Without these, one bad download/upload would freeze the whole queue since
+# only one job is processed at a time.
+DOWNLOAD_TIMEOUT_SECONDS = 600   # 10 minutes
+UPLOAD_TIMEOUT_SECONDS = 600     # 10 minutes
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -296,17 +302,29 @@ async def handle_document(client: Client, message: Message) -> None:
         file_size=doc.file_size or 0,
     )
 
-    position = await job_queue.put(job)
-
-    if position == 1 and not worker_busy:
+    # IMPORTANT: create + attach the status message BEFORE the job is put
+    # on the queue. If we did it after `put()`, the worker could pick the
+    # job up immediately (when idle) and start editing job.status_message
+    # while it's still None, silently dropping the first progress updates.
+    will_start_immediately = job_queue.qsize() == 0 and not worker_busy
+    if will_start_immediately:
         status_msg = await message.reply_text("⏳ Starting conversion shortly...")
     else:
         status_msg = await message.reply_text(
+            "📥 Added to the queue.\nFiguring out your position..."
+        )
+    job.status_message = status_msg
+
+    position = await job_queue.put(job)
+
+    if not will_start_immediately:
+        await safe_edit(
+            status_msg,
             f"📥 Added to the queue.\nCurrent position: **#{position}**\n"
-            "I'll notify you with progress once it's your turn."
+            "I'll notify you with progress once it's your turn.",
         )
 
-    job.status_message = status_msg
+    logger.info("Queued job %s (%s, %.1f MB) at position %s", job.job_id, file_name, job.file_size / (1024*1024), position)
 
 
 @app.on_message(filters.text & ~filters.command(["start", "help", "status"]) | filters.photo | filters.video)
@@ -335,27 +353,61 @@ async def process_job(job: ConversionJob) -> None:
         extract_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Download (MTProto -> up to 2GB, no Bot API 20MB cap)
-        await update_status("📥 Downloading file...")
-        await job.message.download(file_name=str(archive_path))
+        await update_status("📥 Downloading file... (0%)")
+        logger.info("Job %s: download starting", job.job_id)
+
+        last_reported = -1
+
+        async def dl_progress(current: int, total: int) -> None:
+            nonlocal last_reported
+            pct = int(current * 100 / total) if total else 0
+            # only push a Telegram edit every 10% to avoid flood limits
+            if pct != last_reported and pct % 10 == 0:
+                last_reported = pct
+                await update_status(f"📥 Downloading file... ({pct}%)")
+
+        try:
+            await asyncio.wait_for(
+                job.message.download(file_name=str(archive_path), progress=dl_progress),
+                timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise ValueError(
+                f"Download timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes. "
+                "This is usually a network issue on the server — please try again."
+            )
+        logger.info("Job %s: download finished (%.1f MB)", job.job_id, archive_path.stat().st_size / (1024*1024))
 
         # 2. Extract & sort
         await update_status("📂 Extracting and sorting images...")
         image_paths = await asyncio.to_thread(extract_images_from_archive, archive_path, extract_dir)
+        logger.info("Job %s: found %d images", job.job_id, len(image_paths))
 
         # 3. Convert
         await update_status(f"🛠 Converting {len(image_paths)} images to PDF...")
         page_count, skipped = await asyncio.to_thread(build_pdf_from_images, image_paths, output_pdf)
         skip_note = f" ({skipped} unreadable image(s) skipped)" if skipped else ""
+        logger.info("Job %s: PDF built with %d pages (%d skipped)", job.job_id, page_count, skipped)
 
         # 4. Upload
         await update_status("📤 Uploading PDF...")
-        await job.message.reply_document(
-            document=str(output_pdf),
-            file_name=f"{Path(job.file_name).stem}.pdf",
-            caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
-        )
+        try:
+            await asyncio.wait_for(
+                job.message.reply_document(
+                    document=str(output_pdf),
+                    file_name=f"{Path(job.file_name).stem}.pdf",
+                    caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
+                ),
+                timeout=UPLOAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise ValueError(
+                f"Upload timed out after {UPLOAD_TIMEOUT_SECONDS // 60} minutes. "
+                "This is usually a network issue on the server — please try again."
+            )
 
         await update_status(f"✅ Conversion complete — {page_count} page(s){skip_note}. PDF sent above.")
+        logger.info("Job %s: completed successfully", job.job_id)
 
     except ValueError as e:
         # Expected/user-facing errors (corrupt archive, no images, etc.)
