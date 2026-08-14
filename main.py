@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Optional
 
 from PIL import Image, UnidentifiedImageError
+import img2pdf
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
 from telethon.errors import RPCError, MessageNotModifiedError
@@ -117,10 +118,13 @@ class JobQueue:
         self._pending: list[ConversionJob] = []  # for position lookups
         self._lock = asyncio.Lock()
 
-    async def put(self, job: ConversionJob) -> int:
+    async def put(self, job: ConversionJob, currently_busy: bool = False) -> int:
         async with self._lock:
             self._pending.append(job)
-            position = len(self._pending)  # 1-indexed, includes itself
+            # +1 extra if a job is already being actively processed right
+            # now (that job is not in _pending since the worker already
+            # dequeued it), so the displayed position accounts for it too.
+            position = len(self._pending) + (1 if currently_busy else 0)
         await self._queue.put(job)
         return position
 
@@ -201,41 +205,56 @@ def extract_images_from_archive(archive_path: Path, extract_dir: Path) -> list[P
     return image_paths
 
 
-def build_pdf_from_images(image_paths: list[Path], output_pdf: Path) -> tuple[int, int]:
+def build_pdf_from_images(image_paths: list[Path], output_pdf: Path, work_dir: Path) -> tuple[int, int]:
     """Convert a sorted list of image paths into a single PDF.
 
-    Returns (pages_written, pages_skipped). Skips unreadable images
-    individually rather than failing the whole job, unless literally
-    none of them can be read.
+    Uses img2pdf, which streams/embeds image bytes directly into the PDF
+    without decoding full-resolution pixel data for every page at once.
+    This keeps memory usage low even for archives with 150-300+ pages,
+    unlike loading every page as a decoded Pillow Image simultaneously.
+
+    Returns (pages_written, pages_skipped). Skips unreadable/unsupported
+    images individually rather than failing the whole job, unless
+    literally none of them can be used.
     """
-    frames: list[Image.Image] = []
+    # img2pdf natively supports JPEG, PNG, TIFF. Anything else (webp, bmp,
+    # gif, etc.) gets converted to PNG on disk first, one image at a time,
+    # so we never hold more than one full decoded image in memory.
+    NATIVE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    convert_dir = work_dir / "converted"
+    convert_dir.mkdir(parents=True, exist_ok=True)
+
+    usable_paths: list[str] = []
     skipped = 0
 
+    for idx, img_path in enumerate(image_paths):
+        try:
+            if img_path.suffix.lower() in NATIVE_EXTS:
+                # Quick sanity check that it actually opens before trusting it.
+                with Image.open(img_path) as im:
+                    im.verify()
+                usable_paths.append(str(img_path))
+            else:
+                with Image.open(img_path) as im:
+                    im = im.convert("RGB")
+                    converted_path = convert_dir / f"{idx:05d}.png"
+                    im.save(converted_path, format="PNG")
+                usable_paths.append(str(converted_path))
+        except (UnidentifiedImageError, OSError, ValueError):
+            skipped += 1
+            logger.info("Skipping unreadable image: %s", img_path)
+            continue
+
+    if not usable_paths:
+        raise ValueError("None of the images inside the archive could be read/decoded.")
+
     try:
-        for img_path in image_paths:
-            try:
-                img = Image.open(img_path)
-                img.load()  # force read now so we catch errors early
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                frames.append(img)
-            except (UnidentifiedImageError, OSError):
-                skipped += 1
-                logger.info("Skipping unreadable image: %s", img_path)
-                continue
+        pdf_bytes = img2pdf.convert(usable_paths)
+    except Exception as e:
+        raise ValueError(f"Failed to assemble PDF from images: {e}")
 
-        if not frames:
-            raise ValueError("None of the images inside the archive could be read/decoded.")
-
-        first, rest = frames[0], frames[1:]
-        first.save(output_pdf, save_all=True, append_images=rest, format="PDF")
-        return len(frames), skipped
-    finally:
-        for f in frames:
-            try:
-                f.close()
-            except Exception:
-                pass
+    output_pdf.write_bytes(pdf_bytes)
+    return len(usable_paths), skipped
 
 
 # --------------------------------------------------------------------------
@@ -321,7 +340,7 @@ async def handle_document(event: events.NewMessage.Event) -> None:
         status_msg = await event.reply("📥 Added to the queue.\nFiguring out your position...")
     job.status_message = status_msg
 
-    position = await job_queue.put(job)
+    position = await job_queue.put(job, currently_busy=worker_busy)
 
     if not will_start_immediately:
         await safe_edit(
@@ -405,7 +424,7 @@ async def process_job(job: ConversionJob) -> None:
 
         # 3. Convert
         await update_status(f"🛠 Converting {len(image_paths)} images to PDF...")
-        page_count, skipped = await asyncio.to_thread(build_pdf_from_images, image_paths, output_pdf)
+        page_count, skipped = await asyncio.to_thread(build_pdf_from_images, image_paths, output_pdf, work_dir)
         skip_note = f" ({skipped} unreadable image(s) skipped)" if skipped else ""
         logger.info("Job %s: PDF built with %d pages (%d skipped)", job.job_id, page_count, skipped)
 
