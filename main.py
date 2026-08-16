@@ -309,8 +309,39 @@ async def handle_document(event: events.NewMessage.Event) -> None:
 
     ext = Path(file_name).suffix.lower()
 
+    # Some clients (especially forwarded messages from channels) don't
+    # attach a proper filename attribute, so `ext` can end up empty/wrong.
+    # Fall back to the document's mime_type in that case before rejecting.
     if ext not in ALLOWED_EXTENSIONS:
-        await event.reply("❌ Unsupported file type. Please send a `.cbz` or `.zip` file.")
+        mime = (doc.mime_type or "").lower()
+        mime_to_ext = {
+            "application/zip": ".zip",
+            "application/x-zip-compressed": ".zip",
+            "application/x-cbz": ".cbz",
+            "application/vnd.comicbook+zip": ".cbz",
+            "application/octet-stream": None,  # ambiguous, handled below
+        }
+        guessed_ext = mime_to_ext.get(mime)
+        if guessed_ext:
+            ext = guessed_ext
+            if file_name == "archive" or not file_name.lower().endswith(ext):
+                file_name = f"{file_name}{ext}" if "." not in file_name else file_name
+        elif mime == "application/octet-stream" and file_name != "archive":
+            # Generic binary mime + a filename that just lacks the right
+            # suffix (common with forwarded .cbz files) -> trust an
+            # extensionless name only if nothing better is available.
+            pass
+
+    if ext not in ALLOWED_EXTENSIONS:
+        logger.info(
+            "Rejected document: filename=%r mime_type=%r attrs=%r",
+            file_name, doc.mime_type, [type(a).__name__ for a in doc.attributes],
+        )
+        await event.reply(
+            "❌ Unsupported file type (or I couldn't detect the file name/type). "
+            "Please send a `.cbz` or `.zip` file — if you forwarded this from a "
+            "channel, try downloading it and re-uploading it directly instead."
+        )
         return
 
     file_size = doc.size or 0
