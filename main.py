@@ -11,7 +11,7 @@ Telegram Premium accounts) with zero extra setup.
 
 Key features
 ------------
-- Accepts .cbz / .zip files up to 200 MB (configurable, well under
+- Accepts .cbz / .zip files up to 500 MB (configurable, well under
   Telethon's 2 GB ceiling).
 - Extracts images, sorts them naturally (page2 < page10), stitches them
   into one PDF using Pillow.
@@ -74,7 +74,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # Safety limits - tune as needed for your server.
 # Telethon (MTProto) supports up to 2 GB (4 GB for Premium), but keep this
 # reasonable for your server's RAM/disk/CPU.
-MAX_FILE_SIZE_MB = 200
+MAX_FILE_SIZE_MB = 500
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {".cbz", ".zip"}
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
