@@ -459,17 +459,36 @@ async def process_job(job: ConversionJob) -> None:
         skip_note = f" ({skipped} unreadable image(s) skipped)" if skipped else ""
         logger.info("Job %s: PDF built with %d pages (%d skipped)", job.job_id, page_count, skipped)
 
-        # 4. Upload
+        # 4. Upload — preserve the original file's thumbnail and caption
         await update_status("📤 Uploading PDF...")
+
+        # Grab the original caption exactly as-is (if the source file had one).
+        original_caption = job.message.message or job.message.raw_text or ""
+        final_caption = original_caption if original_caption.strip() else None
+
+        # Try to reuse the original document's thumbnail (if it had one).
+        thumb_path: Optional[str] = None
+        try:
+            doc_thumbs = getattr(job.message.document, "thumbs", None)
+            if doc_thumbs:
+                thumb_file = work_dir / "thumb.jpg"
+                downloaded = await client.download_media(job.message, thumb=-1, file=str(thumb_file))
+                if downloaded:
+                    thumb_path = str(thumb_file)
+        except Exception as e:
+            logger.info("Job %s: could not fetch original thumbnail (%s), sending without one", job.job_id, e)
+            thumb_path = None
+
         try:
             await asyncio.wait_for(
                 client.send_file(
                     job.chat_id,
                     str(output_pdf),
-                    caption=f"✅ Done! {page_count} page(s) converted{skip_note}.",
+                    caption=final_caption,
                     force_document=True,
                     file_name=f"{Path(job.file_name).stem}.pdf",
                     reply_to=job.message.id,
+                    thumb=thumb_path,
                 ),
                 timeout=UPLOAD_TIMEOUT_SECONDS,
             )
@@ -479,7 +498,7 @@ async def process_job(job: ConversionJob) -> None:
                 "This is usually a network issue on the server — please try again."
             )
 
-        await update_status(f"✅ Conversion complete — {page_count} page(s){skip_note}. PDF sent above.")
+        await update_status(f"✅ Conversion complete — {page_count} page(s){skip_note} sent above.")
         logger.info("Job %s: completed successfully", job.job_id)
 
     except ValueError as e:
