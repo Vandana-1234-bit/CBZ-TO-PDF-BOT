@@ -46,6 +46,7 @@ asyncio.Queue + a single background worker task.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import re
@@ -249,11 +250,15 @@ def build_pdf_from_images(image_paths: list[Path], output_pdf: Path, work_dir: P
         raise ValueError("None of the images inside the archive could be read/decoded.")
 
     try:
-        pdf_bytes = img2pdf.convert(usable_paths)
+        # Write straight to disk via img2pdf's output stream instead of
+        # building the entire PDF as one big in-memory bytes object first.
+        # For 200+ page volumes this avoids an extra multi-hundred-MB
+        # allocation on top of whatever else is in memory.
+        with open(output_pdf, "wb") as out_f:
+            img2pdf.convert(usable_paths, outputstream=out_f)
     except Exception as e:
         raise ValueError(f"Failed to assemble PDF from images: {e}")
 
-    output_pdf.write_bytes(pdf_bytes)
     return len(usable_paths), skipped
 
 
@@ -517,6 +522,15 @@ async def process_job(job: ConversionJob) -> None:
     finally:
         # Always clean up temp files/dirs for this job, success or failure.
         shutil.rmtree(work_dir, ignore_errors=True)
+        # Force a GC pass between jobs so memory used by this (possibly
+        # 200+ page) conversion doesn't linger/fragment into the next one.
+        gc.collect()
+        try:
+            import resource
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            logger.info("Job %s: process peak RSS so far: %.1f MB", job.job_id, rss_mb)
+        except Exception:
+            pass
 
 
 async def notify_queue_positions() -> None:
